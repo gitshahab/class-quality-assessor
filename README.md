@@ -1,0 +1,1 @@
+# class-quality-assessor

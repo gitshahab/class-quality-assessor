@@ -90,8 +90,7 @@ def score_assessment(video_analysis=None, transcript=None, segments=None):
             )
 
         questions = re.findall(
-            r"\?|"
-            r"\b(what|why|how|when|where|which|who|"
+            r"\?|\b(what|why|how|when|where|which|who|"
             r"can you|could you|do you|did you|any questions)\b",
             text,
             re.IGNORECASE,

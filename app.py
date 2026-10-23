@@ -1,9 +1,72 @@
 import os
 import json
 import streamlit as st
+import re
 
 from src.audio import extract_audio_from_video, transcribe_audio_file
 from src.video import analyze_video
+from src.scoring import score_assessment
+from src.ml_model import predict_lesson
+
+
+def build_ml_features(video_analysis, transcript):
+    """Convert audio transcript and video analysis into model features."""
+
+    metadata = video_analysis.get("video_metadata", {})
+    visual = video_analysis.get("visual_checks", {})
+
+    lighting = visual.get("lighting", {})
+    black_screen = visual.get("black_screen", {})
+    face_visibility = visual.get("face_visibility", {})
+
+    text = transcript or ""
+
+    introduction_present = int(bool(re.search(
+        r"\b(hello|hi everyone|good morning|good afternoon|"
+        r"welcome|how are you|how was your day|nice to meet you)\b",
+        text,
+        re.IGNORECASE,
+    )))
+
+    homework_present = int(bool(re.search(
+        r"\b(homework|assignment|practice questions|worksheet|"
+        r"solve these|for next class|complete the exercise)\b",
+        text,
+        re.IGNORECASE,
+    )))
+
+    closure_present = int(bool(re.search(
+        r"\b(to summarize|in summary|let's recap|today we learned|"
+        r"that's all for today|see you next class|goodbye|bye everyone)\b",
+        text,
+        re.IGNORECASE,
+    )))
+
+    question_count = len(re.findall(
+        r"\?|\b(what|why|how|when|where|which|who|"
+        r"can you|could you|do you|did you|any questions)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+    return {
+        "duration_minutes": (
+            float(metadata["duration_seconds"]) / 60
+            if metadata.get("duration_seconds") is not None
+            else None
+        ),
+        "introduction_present": introduction_present,
+        "question_marker_count": question_count,
+        "homework_present": homework_present,
+        "closure_present": closure_present,
+        "average_brightness": lighting.get("average_frame_brightness"),
+        "dark_frame_ratio": lighting.get("dark_sampled_frame_ratio"),
+        "black_frame_ratio": black_screen.get("sampled_frame_ratio"),
+        "face_detection_ratio": face_visibility.get(
+            "face_detection_ratio"
+        ),
+    }
+
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -41,7 +104,8 @@ if uploaded_file is not None:
     st.success(f"Recording staged locally: {safe_name}")
     extension = os.path.splitext(safe_name)[1].lower()
 
-    audio_tab, video_tab = st.tabs(["🎙️ Audio analysis", "🎞️ Video analysis"])
+    audio_tab, video_tab, assessment_tab = st.tabs(
+    ["🎙️ Audio analysis", "🎞️ Video analysis", "🧠 Combined assessment"])
 
     with audio_tab:
         st.write("Extract speech and produce a timestamped transcript.")
@@ -148,5 +212,126 @@ if uploaded_file is not None:
                     )
                 except Exception as exc:
                     st.error(f"Video pipeline failed: {exc}")
+    with assessment_tab:
+        st.subheader("Combined lesson assessment")
+
+        st.write(
+            "Run audio transcription and video analysis together, then "
+            "compare the heuristic assessment with the experimental ML prediction."
+        )
+
+        if extension != ".mp4":
+            st.info(
+                "The combined assessment requires an MP4 recording "
+                "because the model uses both audio-transcript and video features."
+            )
+        elif st.button(
+            "Run Combined Assessment",
+            type="primary",
+            key="run_combined",
+        ):
+            try:
+                with st.spinner(
+                    "Running audio transcription, video analysis, and assessment..."
+                ):
+                    target_audio = os.path.join(
+                        DATA_DIR, "extracted_audio.wav"
+                    )
+
+                    extract_audio_from_video(input_path, target_audio)
+
+                    audio_result = transcribe_audio_file(
+                        target_audio,
+                        model_size="base",
+                    )
+
+                    transcript = audio_result.get("full_transcript", "")
+                    segments = audio_result.get("segments", [])
+
+                    video_result = analyze_video(
+                        input_path,
+                        sample_interval_seconds=float(sample_interval),
+                    )
+
+                    heuristic_result = score_assessment(
+                        video_analysis=video_result,
+                        transcript=transcript,
+                        segments=segments,
+                    )
+
+                    features = build_ml_features(
+                        video_result,
+                        transcript,
+                    )
+
+                    model_path = "models/lesson_quality_model.joblib"
+
+                    if not os.path.isfile(model_path):
+                        st.error(
+                            "Trained ML model not found. "
+                            "Train it first using src.ml_model.train_model()."
+                        )
+                    else:
+                        ml_result = predict_lesson(features, model_path)
+
+                        st.subheader("1. Heuristic assessment")
+
+                        c1, c2, c3 = st.columns(3)
+
+                        c1.metric(
+                            "Heuristic score",
+                            (
+                                f'{heuristic_result["score"]}/100'
+                                if heuristic_result["score"] is not None
+                                else "Not available"
+                            ),
+                        )
+
+                        c2.metric(
+                            "Heuristic rating",
+                            heuristic_result["rating"],
+                        )
+
+                        c3.metric(
+                            "Evidence coverage",
+                            f'{heuristic_result["evidence_coverage_percent"]:.1f}%',
+                        )
+
+                        st.subheader("2. Experimental ML prediction")
+
+                        st.metric(
+                            "Predicted category",
+                            ml_result["predicted_label"],
+                        )
+
+                        st.warning(
+                            "Experimental only: this model was trained on "
+                            "illustrative synthetic examples. Its prediction "
+                            "is not a reliable teaching-quality grade. "
+                            "Human review is required."
+                        )
+
+                        st.subheader("3. Features supplied to the model")
+                        st.json(features)
+
+                        st.subheader("4. Heuristic evidence")
+                        st.json(heuristic_result["criteria"])
+
+                        report = {
+                            "heuristic_assessment": heuristic_result,
+                            "ml_prediction": ml_result,
+                            "ml_features": features,
+                            "human_review_required": True,
+                        }
+
+                        st.download_button(
+                            "Download combined assessment JSON",
+                            data=json.dumps(report, indent=2),
+                            file_name="combined_assessment.json",
+                            mime="application/json",
+                        )
+
+            except Exception as exc:
+                st.error(f"Combined assessment failed: {exc}")
 else:
     st.info("Upload an MP4 to run both audio and video analysis, or a WAV to run audio analysis.")
